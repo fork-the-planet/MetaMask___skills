@@ -6,7 +6,7 @@ maturity: experimental
 
 # Recipe Evidence
 
-`recipe-evidence` turns recipe outputs into reviewer-facing text. It does not invent proof. If artifacts are missing or weak, say so and call `/recipe-quality`.
+`recipe-evidence` turns recipe outputs into reviewer-facing text. It does not invent proof. If artifacts are missing or weak, say so and call `/mms-recipe-quality`.
 
 Load only what applies:
 
@@ -40,9 +40,45 @@ Use available files:
 - Do not paste long logs.
 - Redact secrets and private account data.
 - Never claim a recipe passed if the run did not complete.
-- Never claim Mobile or Extension runtime proof without a passing `/recipe-harness verify`; report missing harness proof as a gap.
+- Never claim Mobile or Extension runtime proof without a passing `/mms-recipe-harness verify`; report missing harness proof as a gap.
 
 ## Output
+
+Always create a reviewer-copyable package directory under the task folder:
+
+```bash
+.agents/skills/mms-recipe-evidence/scripts/package-pr-evidence.js \
+  --task temp/tasks/<skill>/<run-slug>
+```
+
+The package must contain:
+
+- `pr-package/pr-desc.md` — GitHub PR description draft with explicit
+  drag/drop image markers. This draft must be based on the target repo's
+  `.github/pull-request-template.md` / `.github/pull_request_template.md`
+  when that file exists; only use the generic fallback if no repo template is
+  present.
+- `pr-package/images/` — copied screenshot evidence with short,
+  stable, reviewer-friendly filenames such as
+  `01-ac1-no-btc-position-banner-absent.png`.
+- `pr-package/evidence.md` — full evidence block copied from
+  `PR-READY-EVIDENCE.md` when present.
+- `pr-package/recipe-quality.md` — quality verdict when present.
+- `pr-package/checklist.md` — checklist snapshot when present.
+- `pr-package/package-manifest.json` — machine-readable package index.
+- `pr-package/final-report.md` — human summary with the task path and package
+  path.
+
+If the script cannot infer enough context, still write `pr-desc.md` with TODO
+markers rather than skipping the package. Do not put generated task artifacts in
+the product PR diff; the package is for copy/paste and drag/drop only.
+
+The final response from the high-level skill must print:
+
+- `Task path: <task-dir>`
+- `PR package path: <task-dir>/pr-package`
+- `PR description draft: <task-dir>/pr-package/pr-desc.md`
+- `Evidence images folder: <task-dir>/pr-package/images`
 
 ```md
 ### Recipe validation

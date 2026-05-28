@@ -36,7 +36,8 @@ const cdpPort = (() => {
     const val = parseInt(process.argv[idx + 1] ?? '', 10);
     return Number.isNaN(val) ? 6668 : val;
   }
-  return 6668;
+  const envPort = parseInt(process.env.CDP_PORT || '', 10);
+  return Number.isNaN(envPort) ? 6668 : envPort;
 })();
 
 const G = '\x1b[32m';
@@ -52,7 +53,7 @@ async function main(): Promise<void> {
   let versionInfo: Record<string, string>;
   try {
     versionInfo = (await httpGetJson(
-      `http://localhost:${cdpPort}/json/version`,
+      `http://127.0.0.1:${cdpPort}/json/version`,
     )) as Record<string, string>;
     process.stdout.write(`${G}Connected${X}  ${versionInfo.Browser ?? 'unknown browser'}\n`);
   } catch {
@@ -62,7 +63,7 @@ async function main(): Promise<void> {
 
   // 2. List targets
   const targets = (await httpGetJson(
-    `http://localhost:${cdpPort}/json/list`,
+    `http://127.0.0.1:${cdpPort}/json/list`,
   )) as Array<{
     type: string;
     url: string;
@@ -106,7 +107,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const browser = await chromium.connectOverCDP(`http://localhost:${cdpPort}`);
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
   const contexts = browser.contexts();
   let page = null;
   for (const ctx of contexts) {

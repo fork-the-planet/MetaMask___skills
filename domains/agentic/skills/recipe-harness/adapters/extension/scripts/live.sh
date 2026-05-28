@@ -4,6 +4,7 @@ set -euo pipefail
 TARGET="$PWD"
 CDP_PORT=""
 ARTIFACTS=""
+OUT="temp/agentic/recipes"
 PREPARE_CMD="${RECIPE_HARNESS_EXTENSION_LAUNCH_CMD:-}"
 LAUNCH_EXISTING_DIST=false
 START_TEST_WATCH=false
@@ -12,6 +13,7 @@ CHROME_USER_DATA_DIR=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
     --cdp-port) CDP_PORT="$2"; shift 2 ;;
     --artifacts-dir) ARTIFACTS="$2"; shift 2 ;;
     --prepare-cmd) PREPARE_CMD="$2"; shift 2 ;;
@@ -19,7 +21,7 @@ while [ "$#" -gt 0 ]; do
     --start-test-watch) START_TEST_WATCH=true; LAUNCH_EXISTING_DIST=true; shift ;;
     --dist-dir) DIST_DIR="$2"; shift 2 ;;
     --chrome-user-data-dir) CHROME_USER_DATA_DIR="$2"; shift 2 ;;
-    -h|--help) echo "Usage: live.sh [--target <metamask-extension>] --cdp-port <port> [--launch-existing-dist|--start-test-watch|--prepare-cmd <cmd>] [--dist-dir dist/chrome] [--artifacts-dir <dir>]"; exit 0 ;;
+    -h|--help) echo "Usage: live.sh [--target <metamask-extension>] [--out <temp/agentic/recipes>] --cdp-port <port> [--launch-existing-dist|--start-test-watch|--prepare-cmd <cmd>] [--dist-dir dist/chrome] [--artifacts-dir <dir>]"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -39,7 +41,12 @@ if $LAUNCH_EXISTING_DIST && [ -z "$PREPARE_CMD" ]; then
   quoted_dist="$(printf '%q' "$DIST_ABS")"
   quoted_runtime_dist="$(printf '%q' "$RUNTIME_DIST_ABS")"
   quoted_profile="$(printf '%q' "$PROFILE_ABS")"
-  CHROME_BIN="${RECIPE_HARNESS_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  if [ -n "${RECIPE_HARNESS_CHROME_BIN:-}" ]; then
+    CHROME_BIN="$RECIPE_HARNESS_CHROME_BIN"
+  else
+    CHROME_BIN="$(cd "$TARGET" && node -e 'for (const pkg of ["@playwright/test", "playwright"]) { try { const { chromium } = require(pkg); const p = chromium.executablePath(); if (p) { process.stdout.write(p); process.exit(0); } } catch {} } process.exit(1);' 2>/dev/null || true)"
+    CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  fi
   quoted_chrome="$(printf '%q' "$CHROME_BIN")"
   quoted_chrome_log="$(printf '%q' "$ARTIFACTS/logs/chrome.log")"
   quoted_chrome_pid="$(printf '%q' "$ARTIFACTS/logs/chrome.pid")"
@@ -58,7 +65,9 @@ if $LAUNCH_EXISTING_DIST && [ -z "$PREPARE_CMD" ]; then
   chrome_launch_cmd="nohup ${quoted_chrome} --user-data-dir=${quoted_profile}"
   chrome_launch_cmd+=" --remote-debugging-address=127.0.0.1 --remote-debugging-port=${CDP_PORT}"
   chrome_launch_cmd+=" --no-first-run --disable-first-run-ui --disable-default-apps --disable-popup-blocking"
-  chrome_launch_cmd+=" --disable-extensions-file-access-check --disable-features=ExtensionContentVerification"
+  chrome_launch_cmd+=" --disable-extensions-file-access-check --disable-extensions-content-verification"
+  chrome_launch_cmd+=" --disable-features=ExtensionContentVerification,DisableLoadExtensionCommandLineSwitch"
+  chrome_launch_cmd+=" --disable-extensions-except=${quoted_runtime_dist}"
   chrome_launch_cmd+=" --load-extension=${quoted_runtime_dist} chrome://extensions/"
   chrome_launch_cmd+=" > ${quoted_chrome_log} 2>&1 & echo \$! > ${quoted_chrome_pid}"
   prepare_parts+=("$chrome_launch_cmd")
@@ -87,7 +96,7 @@ set -e
 verify_status=1
 if [ "$launch_status" -eq 0 ]; then
   set +e
-  "$SCRIPT_DIR/verify.sh" --target "$TARGET" --cdp-port "$CDP_PORT" --artifacts-dir "$ARTIFACTS/verify"
+  "$SCRIPT_DIR/verify.sh" --target "$TARGET" --out "$OUT" --cdp-port "$CDP_PORT" --artifacts-dir "$ARTIFACTS/verify"
   verify_status=$?
   set -e
 else
