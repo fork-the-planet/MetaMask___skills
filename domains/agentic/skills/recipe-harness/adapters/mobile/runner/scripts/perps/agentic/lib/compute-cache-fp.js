@@ -21,11 +21,77 @@
 // added ignorePaths cover per-worktree dev/build artifacts that don't
 // affect binary semantics (compile outputs, IDE state, NDK cache,
 // per-machine `.xcode.env.local`).
-// Binary-affecting inputs — env-populated xcconfig, `google-services.json`,
-// the bridge source — stay hashed. The cache only converges across
-// worktrees when those inputs match, which is the correct behaviour.
+// Binary-affecting inputs stay hashed for the platform they can affect.
+// Platform-specific native dirs are separated so an Android-only generated
+// file (for example android/app/google-services.json) does not invalidate
+// an iOS simulator build cache, and iOS-only generated state does not
+// invalidate Android. Shared native inputs (package/yarn lock, config
+// plugins, autolinked native modules, build/setup scripts) still converge
+// only when they match.
 
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const fp = require('@expo/fingerprint');
+
+function parsePlatform(argv) {
+  const index = argv.indexOf('--platform');
+  const value = index >= 0 ? argv[index + 1] : process.env.RECIPE_HARNESS_PLATFORM;
+  if (!value) return null;
+  if (value !== 'ios' && value !== 'android') {
+    throw new Error(`unknown --platform '${value}' (expected ios|android)`);
+  }
+  return value;
+}
+
+const platform = parsePlatform(process.argv.slice(2));
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizedPackageHash(projectRoot) {
+  const file = path.join(projectRoot, 'package.json');
+  const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  // Yarn scripts are developer ergonomics and do not affect the native binary.
+  // In particular, installing/upgrading the harness changes a:* scripts; that
+  // must not invalidate a native cache shared by otherwise-identical worktrees.
+  delete pkg.scripts;
+  const stable = stableStringify(pkg);
+  return crypto.createHash('sha1').update(stable).digest('hex');
+}
+
+function recomputeHash(sources, projectRoot) {
+  const hasher = crypto.createHash('sha1');
+  const normalizedPkgHash = normalizedPackageHash(projectRoot);
+  const normalizedSources = sources
+    .map((source) => ({ ...source }))
+    .sort((a, b) => {
+      const left = a.type === 'contents' ? a.id : a.filePath;
+      const right = b.type === 'contents' ? b.id : b.filePath;
+      const leftKey = String(left);
+      const rightKey = String(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+  for (const source of normalizedSources) {
+    if (source.id === 'packageJson:scripts') {
+      continue;
+    }
+    if (source.filePath === 'package.json') {
+      source.hash = normalizedPkgHash;
+      source.reasons = [...(source.reasons || []), 'normalized package.json without scripts'];
+    }
+    if (source.hash != null) {
+      hasher.update(source.type === 'contents' ? source.id : source.filePath);
+      hasher.update(source.hash);
+    }
+  }
+  return hasher.digest('hex');
+}
 // Import the project's config so future additions to its extraSources
 // automatically flow into the agentic fingerprint. Using require here
 // (vs. literally copying the list) means a new entry in
@@ -74,12 +140,29 @@ const options = {
     // built app does not invalidate itself on the next preflight.
     'ios/Podfile.lock',
     'ios/Pods/**',
+    // Agent/local state never affects native binaries.
+    '.agent/**',
+    '.agents/**',
+    '.claude/**',
+    '.cursor/**',
+    'temp/**',
   ],
 };
 
+if (platform === 'ios') {
+  // iOS simulator builds must not miss cache because Android-only generated
+  // files differ between worktrees (for example android/app/google-services.json).
+  options.ignorePaths.push('android/**');
+}
+if (platform === 'android') {
+  // Android builds must not miss cache because iOS-only generated Pods,
+  // workspaces, or entitlements differ between worktrees.
+  options.ignorePaths.push('ios/**');
+}
+
 fp.createFingerprintAsync(process.cwd(), options)
-  .then(({ hash }) => {
-    process.stdout.write(hash);
+  .then((fingerprint) => {
+    process.stdout.write(recomputeHash(fingerprint.sources, process.cwd()));
   })
   .catch((err) => {
     process.stderr.write(`compute-cache-fp: ${err.message}\n`);

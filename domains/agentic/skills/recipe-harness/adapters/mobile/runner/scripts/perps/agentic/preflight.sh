@@ -51,6 +51,8 @@ resolve_path() {
 }
 
 PORT="${WATCHER_PORT:-8081}"
+# Cap Expo/Metro transform workers to avoid per-slot RSS explosions.
+METRO_MAX_WORKERS="${METRO_MAX_WORKERS:-2}"
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "ERROR: WATCHER_PORT must be numeric (got: $PORT)" >&2; exit 1; }
 SCRIPTS="scripts/perps/agentic"
 LOGFILE="$(resolve_path '.agent/metro.log')"
@@ -59,7 +61,7 @@ DEPS_LOG="${LOG_DIR}/deps.log"
 POD_INSTALL_LOG="${LOG_DIR}/pod-install.log"
 CDP_LOG="${LOG_DIR}/cdp.log"
 WALLET_LOG="${LOG_DIR}/wallet-setup.log"
-CDP_WAIT_TIMEOUT=90
+CDP_WAIT_TIMEOUT="${CDP_WAIT_TIMEOUT:-420}"
 CDP_RETRY=0
 
 # Flags
@@ -308,17 +310,39 @@ run_with_live_log() {
   return $rc
 }
 
+js_deps_fingerprint() {
+  { [ -f package.json ] && shasum package.json; [ -f yarn.lock ] && shasum yarn.lock; } | shasum | awk '{print $1}'
+}
+
 js_dependencies_need_install() {
-  # Worktrees often survive branch switches. If package.json / yarn.lock are
-  # newer than Yarn's node_modules state, or if a required workspace binary is
-  # missing, reconcile node_modules before invoking Expo. This preserves the
-  # normal `yarn expo ...` path while fixing stale installs at the source.
+  # Worktrees often survive branch switches. Use content fingerprinting instead
+  # of package.json mtime alone because harness install refreshes package.json
+  # overlays without changing dependency contents. This keeps live validation
+  # idempotent and avoids invalidating Metro caches before every launch.
+  local stamp=".agent/build-cache/js-deps.fingerprint"
+  local fp
   [ ! -d node_modules ] && return 0
   [ ! -f node_modules/.yarn-state.yml ] && return 0
+  yarn bin expo >/dev/null 2>&1 || return 0
+  fp="$(js_deps_fingerprint)"
+  if [ -f "$stamp" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = "$fp" ]; then
+    return 1
+  fi
   [ -f package.json ] && [ package.json -nt node_modules/.yarn-state.yml ] && return 0
   [ -f yarn.lock ] && [ yarn.lock -nt node_modules/.yarn-state.yml ] && return 0
-  yarn bin expo >/dev/null 2>&1 || return 0
+  # Missing/stale agentic fingerprint metadata is not enough to mutate during
+  # --check-only. The next non-check preflight will write the stamp via
+  # mark_js_dependencies_reconciled after a real dependency reconciliation.
+  $CHECK_ONLY && return 1
+  mkdir -p "$(dirname "$stamp")"
+  printf '%s\n' "$fp" > "$stamp"
   return 1
+}
+
+mark_js_dependencies_reconciled() {
+  local stamp=".agent/build-cache/js-deps.fingerprint"
+  mkdir -p "$(dirname "$stamp")"
+  js_deps_fingerprint > "$stamp"
 }
 
 # ── Early fixture validation (fail fast before long pipeline) ────────
@@ -424,7 +448,7 @@ sweep_port() {
   [ -z "$holder_pid" ] && return 0
 
   # Probe /status first — if Metro responds, it's alive and reusable regardless of process name
-  if curl -sf "http://localhost:$port/status" >/dev/null 2>&1; then
+  if curl -sf --max-time 2 "http://localhost:$port/status" >/dev/null 2>&1; then
     ok "Port $port ($label) — Metro already running (PID $holder_pid), reusing"
     # start-metro.sh will detect running Metro and only launch the app
     return 0
@@ -465,6 +489,7 @@ if $JS_DEPS_STALE; then
     tail -20 "$DEPS_LOG" | sed 's/^/    /'
     fail "yarn install --immutable failed"
   fi
+  mark_js_dependencies_reconciled
   ok "node_modules reconciled"
 fi
 
@@ -547,7 +572,7 @@ if [ "$PLAT" = "ios" ]; then
   # which intentionally bypass the cache. This is a deliberate behaviour
   # change vs origin/main: default mode now opts into fingerprint-gated reuse.
   if $BUILD_CACHE_ENABLED && [ "$MODE" != "clean" ] && [ "$MODE" != "rebuild-native" ]; then
-    FP=$(bc_fingerprint 2>/dev/null || true)
+    FP=$(bc_fingerprint ios 2>/dev/null || true)
     if [ -n "$FP" ]; then
       INSTALLED_FP=$(bc_installed_fp ios)
       INSTALLED_TGT=$(bc_installed_target ios)
@@ -587,8 +612,9 @@ if [ "$PLAT" = "ios" ]; then
             fi
           elif [ "$MODE" = "fast" ]; then
             bc_lock_release; BC_LOCK_HELD=false; trap - EXIT
-            fail "Mode 'fast' but no cached build for fp ${FP:0:12} and app not installed at this fingerprint on $SIM_TARGET"
+            fail "Mode 'fast' but no cached iOS build for fp ${FP:0:12} and app not installed at this fingerprint on $SIM_TARGET. Use the skill-owned recipe-harness launch --preflight-mode auto, or call this preflight with --mode auto, only after explicit runtime/rebuild approval to create the shared cache."
           else
+            warn "Cache miss: no shared iOS artifact for fp ${FP:0:12}; ${MODE} mode will build once and store it for matching worktrees."
             # Cache miss in auto/default mode. Whatever is installed (if anything)
             # is at the wrong fingerprint; force the build gate to fire so we
             # produce + install a fresh artifact instead of running a stale app.
@@ -661,7 +687,7 @@ if [ "$PLAT" = "ios" ]; then
     # binds the hardcoded default 8081, which collides with other worktrees and
     # causes the installed app to register its Hermes inspector on 8081 instead of
     # the worktree's $PORT — breaking CDP discovery.
-    EXPO_ARGS=(yarn expo run:ios --no-install --port "$PORT" --configuration Debug --scheme MetaMask)
+    EXPO_ARGS=(yarn expo run:ios --no-install --port "$PORT" --max-workers "$METRO_MAX_WORKERS" --configuration Debug --scheme MetaMask)
     [ -n "${IOS_SIMULATOR:-}" ] && EXPO_ARGS+=(--device "$IOS_SIMULATOR")
 
     # expo run:ios does not exit after a successful build — it keeps Metro running
@@ -678,7 +704,7 @@ if [ "$PLAT" = "ios" ]; then
     BUILD_START=$(date +%s)
 
     set +e
-    "${EXPO_ARGS[@]}" >"$BUILD_LOG" 2>&1 &
+    env EXPO_NO_TYPESCRIPT_SETUP=1 "${EXPO_ARGS[@]}" >"$BUILD_LOG" 2>&1 &
     EXPO_PID=$!
     # Drop the bg job from bash's jobs table so kill_tree's SIGTERM doesn't print "Terminated: 15".
     disown "$EXPO_PID" 2>/dev/null || true
@@ -687,18 +713,26 @@ if [ "$PLAT" = "ios" ]; then
     WATCH_PID=$!
 
     APP_PATH=""
-    BUILD_TIMEOUT=900
+    BUILD_IDLE_TIMEOUT="${MMS_IOS_BUILD_IDLE_TIMEOUT:-900}"
+    LAST_LOG_MTIME="$BUILD_START"
+    LAST_PROGRESS="$BUILD_START"
     while :; do
       NOW=$(date +%s)
       ELAPSED=$((NOW - BUILD_START))
-      if [ $ELAPSED -ge $BUILD_TIMEOUT ]; then
+      LOG_MTIME=$(stat -f %m "$BUILD_LOG" 2>/dev/null || echo "$BUILD_START")
+      if [ "$LOG_MTIME" -gt "$LAST_LOG_MTIME" ]; then
+        LAST_LOG_MTIME="$LOG_MTIME"
+        LAST_PROGRESS="$NOW"
+      fi
+      IDLE=$((NOW - LAST_PROGRESS))
+      if [ "$IDLE" -ge "$BUILD_IDLE_TIMEOUT" ]; then
         kill "$WATCH_PID" 2>/dev/null || true; wait "$WATCH_PID" 2>/dev/null || true
         kill_tree "$EXPO_PID"
         wait $EXPO_PID 2>/dev/null || true
         echo ""
         echo -e "  ${RED}Build log tail:${NC}"
         tail -30 "$BUILD_LOG" | sed 's/^/    /'
-        fail "Build timed out after ${BUILD_TIMEOUT}s — see $BUILD_LOG"
+        fail "Build produced no log progress for ${BUILD_IDLE_TIMEOUT}s after ${ELAPSED}s elapsed — see $BUILD_LOG"
       fi
 
       # Look for a freshly-built .app (mtime >= build start) once xcodebuild reports success.
@@ -792,7 +826,7 @@ if [ "$PLAT" = "ios" ]; then
     # Publish to shared cache. If we hold the lock from the cache-decision
     # phase, store + release directly; else (clean/rebuild-native) bc_with_lock.
     if $BUILD_CACHE_ENABLED && [ -n "${APP_PATH:-}" ]; then
-      FP=$(bc_fingerprint 2>/dev/null || true)
+      FP=$(bc_fingerprint ios 2>/dev/null || true)
       if [ -n "$FP" ]; then
         if $BC_LOCK_HELD; then
           if bc_store_artifact ios "$FP" "$APP_PATH"; then
@@ -876,7 +910,7 @@ else
 
   # ── Build-cache lookup (auto/fast/default modes only) ────────────
   if $BUILD_CACHE_ENABLED && [ "$MODE" != "clean" ] && [ "$MODE" != "rebuild-native" ]; then
-    FP=$(bc_fingerprint 2>/dev/null || true)
+    FP=$(bc_fingerprint "$PLAT" 2>/dev/null || true)
     if [ -n "$FP" ]; then
       INSTALLED_FP=$(bc_installed_fp android)
       INSTALLED_TGT=$(bc_installed_target android)
@@ -914,8 +948,9 @@ else
             fi
           elif [ "$MODE" = "fast" ]; then
             bc_lock_release; BC_LOCK_HELD=false; trap - EXIT
-            fail "Mode 'fast' but no cached build for fp ${FP:0:12} and app not installed at this fingerprint on $ADB_DEVICE_ID"
+            fail "Mode 'fast' but no cached Android build for fp ${FP:0:12} and app not installed at this fingerprint on $ADB_DEVICE_ID. Use the skill-owned recipe-harness launch --preflight-mode auto, or call this preflight with --mode auto, only after explicit runtime/rebuild approval to create the shared cache."
           else
+            warn "Cache miss: no shared Android artifact for fp ${FP:0:12}; ${MODE} mode will build once and store it for matching worktrees."
             # Cache miss in auto/default mode. Stale app must not pass the build
             # gate untouched; force a fresh build + install.
             APP_INSTALLED=0
@@ -992,7 +1027,7 @@ else
     # from the cache-decision phase, store directly; otherwise (clean/rebuild-native)
     # acquire-and-release inline via bc_with_lock.
     if $BUILD_CACHE_ENABLED && [ -n "${APK_PATH:-}" ]; then
-      FP=$(bc_fingerprint 2>/dev/null || true)
+      FP=$(bc_fingerprint "$PLAT" 2>/dev/null || true)
       if [ -n "$FP" ]; then
         if $BC_LOCK_HELD; then
           if bc_store_artifact android "$FP" "$APK_PATH"; then
@@ -1026,8 +1061,8 @@ fi
 # ── Shared steps (both platforms) ────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 
-# --check-only is read-only: probes above fail loud on mismatch; here we
-# must not run Metro / CDP / wallet (all state-changing).
+# --check-only is read-only: probes above fail loud on mismatch; it must
+# exit before any app-data reset, Metro launch, CDP call, or wallet mutation.
 if $CHECK_ONLY; then
   TOTAL_ELAPSED=$(elapsed_since $PREFLIGHT_START)
   echo ""
@@ -1040,12 +1075,38 @@ if $CHECK_ONLY; then
   exit 0
 fi
 
+# Reset app data for deterministic fixture wallet setup while preserving the
+# installed binary/cache. This avoids the fragile existing-vault unlock path and
+# makes `--wallet-setup` idempotent without forcing a native rebuild.
+if $DO_WALLET_SETUP; then
+  if [ "$PLAT" = "ios" ]; then
+    echo ""
+    echo "  Resetting app data for wallet fixture (preserve installed app/cache)..."
+    xcrun simctl terminate "$SIM_TARGET" "$BUNDLE_ID" 2>/dev/null || true
+    DATA_DIR=$(xcrun simctl get_app_container "$SIM_TARGET" "$BUNDLE_ID" data 2>/dev/null || true)
+    if [ -z "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
+      fail "Could not resolve iOS app data container for $BUNDLE_ID on $SIM_TARGET"
+    fi
+    find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    ok "App data cleared: $DATA_DIR"
+  else
+    echo ""
+    echo "  Resetting app data for wallet fixture (adb pm clear)..."
+    $ADB_CMD shell pm clear "$PACKAGE_ID" >/dev/null 2>&1 || fail "adb pm clear failed for $PACKAGE_ID"
+    ok "App data cleared for $PACKAGE_ID"
+  fi
+fi
+
 # ── Step: Metro ─────────────────────────────────────────────────────
 step "Starting Metro" "Bundler on port $PORT → logs at $LOGFILE"
 stage_log "$LOGFILE"
 # start-metro.sh detects running Metro and skips start. With --launch it
 # opens the app via expo deeplink for the target platform regardless.
-bash "$SCRIPTS/start-metro.sh" --platform "$PLAT" $($DO_LAUNCH && echo "--launch" || echo "")
+metro_args=("$SCRIPTS/start-metro.sh" --platform "$PLAT")
+if $DO_LAUNCH; then
+  metro_args+=(--launch)
+fi
+bash "${metro_args[@]}"
 ok "Metro running on port $PORT"
 
 # NOTE: App launch is handled by start-metro.sh --launch (via expo deeplink).
@@ -1057,7 +1118,7 @@ step "Connecting CDP" "Waiting for app to expose debug target"
 stage_log "$CDP_LOG"
 printf '$ node %s/cdp-bridge.js status\n' "$SCRIPTS" > "$CDP_LOG"
 while [ $CDP_RETRY -lt $CDP_WAIT_TIMEOUT ]; do
-  CDP_STATUS_OUTPUT=$(node "$SCRIPTS/cdp-bridge.js" status 2>&1 || true)
+  CDP_STATUS_OUTPUT=$(CDP_TIMEOUT="${CDP_TIMEOUT:-2000}" CDP_DISCOVERY_RETRIES="${CDP_DISCOVERY_RETRIES:-1}" node "$SCRIPTS/cdp-bridge.js" status 2>&1 || true)
   printf '[attempt %s]\n%s\n' "$((CDP_RETRY + 1))" "$CDP_STATUS_OUTPUT" >>"$CDP_LOG"
   if echo "$CDP_STATUS_OUTPUT" | grep -q '"route"' 2>/dev/null; then
     ok "CDP connected"
@@ -1130,7 +1191,8 @@ if $DO_WALLET_SETUP; then
       tail -12 "$WALLET_LOG" | sed 's/^/  /'
       ok "Wallet configured"
     else
-      warn "Wallet setup failed — see $WALLET_LOG"
+      tail -40 "$WALLET_LOG" | sed 's/^/  /' >&2 || true
+      fail "Wallet setup failed — see $WALLET_LOG"
     fi
   else
     warn "No fixture at $WALLET_FIXTURE"

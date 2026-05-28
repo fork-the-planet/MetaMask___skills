@@ -11,6 +11,8 @@ Use the Extension adapter for `metamask-extension` checkouts, especially histori
 
 ```bash
 .agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension install --target .
+.agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension launch --target . --cdp-port <port>
+.agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension live --target . --cdp-port <port> --launch-existing-dist
 .agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension verify --target . --cdp-port <port>
 .agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension verify --target . --static-only
 .agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension cleanup --target .
@@ -22,6 +24,8 @@ If running from the source skills checkout instead, use:
 
 ```bash
 domains/agentic/skills/recipe-harness/scripts/recipe-harness.sh extension install --target /path/to/metamask-extension
+domains/agentic/skills/recipe-harness/scripts/recipe-harness.sh extension launch --target /path/to/metamask-extension --cdp-port 9222
+domains/agentic/skills/recipe-harness/scripts/recipe-harness.sh extension live --target /path/to/metamask-extension --cdp-port 9222 --launch-existing-dist
 domains/agentic/skills/recipe-harness/scripts/recipe-harness.sh extension verify --target /path/to/metamask-extension --cdp-port 9222
 ```
 
@@ -48,6 +52,9 @@ For live runtime proof, verify that:
 - one non-UI sample recipe passes;
 - one UI/browser target-inspect sample passes when feasible;
 - product diffs exclude `temp/agentic/**` and harness files.
+- fixture/profile status is printed before long debugging (`READY`,
+  `MISSING_FIXTURES`, or `STALE_OR_INVALID`).
+- CDP/profile/watch reuse decisions are recorded in the verification summary.
 
 Use command recipes for reducers, selectors, controllers, migrations, build/config checks, and other non-UI claims. Use browser/UI actions only for visible Extension behavior.
 
@@ -63,4 +70,8 @@ When an orchestrator prepares an Extension checkout before running this harness:
   for the intended extension; a listening CDP port alone is not sufficient.
 - Use `adapters/extension/scripts/extension-readiness.js --target <repo>
 --cdp-port <port>` as the source-of-truth readiness probe when wiring
-  Farmslot or other runners.
+  caller-owned runners.
+- Prefer reusing a compatible harness-owned Chrome/CDP profile and existing
+  watch output. If a prepare command would trigger a full rebuild, say that
+  before starting it and either set a cached/watch-only
+  `RECIPE_HARNESS_EXTENSION_LAUNCH_CMD` or ask the human to approve the rebuild.

@@ -3,11 +3,13 @@ set -euo pipefail
 
 TARGET="$PWD"
 ALLOW_DIRTY=false
+FORCE_OVERLAY=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
     --allow-dirty-harness-paths) ALLOW_DIRTY=true; shift ;;
-    -h|--help) echo "Usage: install.sh [--target <metamask-mobile>] [--allow-dirty-harness-paths]"; exit 0 ;;
+    --force-overlay) FORCE_OVERLAY=true; shift ;;
+    -h|--help) echo "Usage: install.sh [--target <metamask-mobile>] [--allow-dirty-harness-paths] [--force-overlay]"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -15,6 +17,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADAPTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SKILL_DIR="$(cd "${ADAPTER_DIR}/../.." && pwd)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/hash-helpers.sh"
 TARGET="$(cd "$TARGET" && pwd)"
 HARNESS_DIR="$TARGET/.agent/recipe-harness/mobile"
 if GIT_BACKUP_PATH="$(git -C "$TARGET" rev-parse --git-path recipe-harness/mobile/backup 2>/dev/null)"; then
@@ -34,69 +38,112 @@ STATE_FILE="$BACKUP_DIR/state.env"
 
 mkdir -p "$HARNESS_DIR"
 
+git_tracks_any_under() {
+  git -C "$TARGET" ls-files -- "$1" 2>/dev/null | grep -q .
+}
+
+has_product_owned_mobile_harness() {
+  # If the product repo tracks any first-party harness subtree, installing the
+  # skill overlay must be metadata-only by default. Requiring every marker to be
+  # present is unsafe for older/partial Mobile commits: falling through would
+  # rsync --delete tracked product-owned files without --force-overlay.
+  git_tracks_any_under "scripts/perps/agentic" && return 0
+  git_tracks_any_under "app/core/AgenticService" && return 0
+
+  # Marker fallback for checkouts where the harness was patched but not tracked.
+  grep -q "AgenticService.install" "$TARGET/app/core/NavigationService/NavigationService.ts" 2>/dev/null \
+    && grep -q "AgentStepHud" "$TARGET/app/components/Nav/App/App.tsx" 2>/dev/null
+}
+
+add_git_exclude_entry() {
+  local entry="$1"
+  local tracking_file="${2:-}"
+  local git_dir
+  local exclude_file
+  if ! git_dir="$(git -C "$TARGET" rev-parse --git-dir 2>/dev/null)"; then
+    return 0
+  fi
+  case "$git_dir" in
+    /*) ;;
+    *) git_dir="$TARGET/$git_dir" ;;
+  esac
+  exclude_file="$git_dir/info/exclude"
+  mkdir -p "$(dirname "$exclude_file")"
+  touch "$exclude_file"
+  if ! grep -qxF "$entry" "$exclude_file"; then
+    echo "$entry" >> "$exclude_file"
+    if [ -n "$tracking_file" ]; then
+      echo "$entry" >> "$tracking_file"
+    fi
+  fi
+}
+
+if [ "$FORCE_OVERLAY" = false ] && has_product_owned_mobile_harness; then
+  SOURCE_REV="$(git -C "$SKILL_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  add_git_exclude_entry ".agent/recipe-harness/"
+  add_git_exclude_entry ".skills-cache/"
+  add_git_exclude_entry "temp/agentic/recipe-harness/"
+  node -e '
+    const fs = require("fs");
+    const m = {
+      adapter: "mobile",
+      installMode: "product-owned",
+      installedAt: new Date().toISOString(),
+      source: { skillDir: process.argv[1], revision: process.argv[2], runtime: process.argv[3] },
+      target: process.argv[4],
+      installedPaths: [],
+      patchedFiles: [],
+      productOwnedPaths: [
+        "scripts/perps/agentic",
+        "app/core/AgenticService",
+        "package.json",
+        "app/core/NavigationService/NavigationService.ts",
+        "app/components/Nav/App/App.tsx"
+      ],
+      backupDir: null,
+      cleanupCommand: process.argv[5] + "/cleanup.sh --target " + process.argv[4],
+      productDiffExcludes: [
+        ":(exclude).agent/recipe-harness",
+        ":(exclude).skills-cache",
+        ":(exclude)temp/agentic/recipe-harness"
+      ],
+      note: "This checkout already contains the first-party Mobile agentic harness. Skill install only writes recipe-harness metadata and must not overwrite tracked product harness files."
+    };
+    fs.writeFileSync(process.argv[6], JSON.stringify(m, null, 2) + "\n");
+  ' "$SKILL_DIR" "$SOURCE_REV" "$ADAPTER_DIR" "$TARGET" "$SCRIPT_DIR" "$HARNESS_DIR/manifest.json"
+  echo "Installed mobile recipe harness metadata only (product-owned harness detected): $HARNESS_DIR/manifest.json"
+  exit 0
+fi
+
 INSTALLED=false
 INSTALL_MUTATING=false
 ROLLBACK_BACKUP_DIR="$BACKUP_DIR"
 ROLLBACK_STATE_FILE="$STATE_FILE"
 REFRESH_BACKUP_DIR=""
-
-digest_file() {
-  local file="$1"
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" | awk '{print $NF}'
-  else
-    echo "Error: need shasum, sha256sum, or openssl for mobile harness hashing." >&2
-    exit 1
-  fi
-}
-
-digest_stdin() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 | awk '{print $NF}'
-  else
-    echo "Error: need shasum, sha256sum, or openssl for mobile harness hashing." >&2
-    exit 1
-  fi
-}
-
-hash_path() {
-  local item="$1"
-  if [ ! -e "$TARGET/$item" ]; then
-    printf 'MISSING'
-  elif [ -d "$TARGET/$item" ]; then
-    (
-      cd "$TARGET"
-      find "$item" -type f | LC_ALL=C sort | while IFS= read -r file; do
-        printf '%s  %s\n' "$(digest_file "$file")" "$file"
-      done | digest_stdin
-    )
-  else
-    (cd "$TARGET" && digest_file "$item")
-  fi
-}
+REBASE_BACKUP=false
 
 verify_installed_paths_unchanged() {
   local hash_file="$BACKUP_DIR/managed-hashes.tsv"
   if [ ! -f "$hash_file" ]; then
     return 0
   fi
-  local rel expected actual conflicts=0
+  local rel expected actual conflicts=0 stale_clean=0
   while IFS=$'\t' read -r rel expected; do
     [ -n "$rel" ] || continue
     actual="$(hash_path "$rel")"
     if [ "$actual" != "$expected" ]; then
-      echo "Refusing to refresh mobile recipe harness: managed path changed after install: $rel" >&2
-      echo "  expected: $expected" >&2
-      echo "  actual:   $actual" >&2
-      conflicts=1
+      if git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1 \
+        && [ -z "$(git -C "$TARGET" status --porcelain -- "$rel")" ]; then
+        echo "Mobile recipe harness managed path changed after install but is clean in git: $rel" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        stale_clean=1
+      else
+        echo "Refusing to refresh mobile recipe harness: managed path changed after install: $rel" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        conflicts=1
+      fi
     fi
   done < "$hash_file"
   if [ "$conflicts" != "0" ]; then
@@ -105,6 +152,14 @@ Reinstall would bless local edits as harness-managed and make cleanup unsafe.
 Save/stash product changes or rerun with --allow-dirty-harness-paths if you intentionally want to overwrite and refresh harness-managed state.
 EOF
     exit 1
+  fi
+  if [ "$stale_clean" != "0" ]; then
+    cat >&2 <<EOF
+Managed hashes are stale, but all changed harness-managed paths are clean in git.
+This usually means the checkout was reset/rebased after a previous harness install.
+Rebaselining the harness backup to the current clean checkout before refreshing.
+EOF
+    REBASE_BACKUP=true
   fi
 }
 
@@ -222,7 +277,7 @@ rollback_failed_install() {
 
 trap 'rollback_failed_install $?' ERR
 
-if [ ! -f "$STATE_FILE" ]; then
+if [ ! -f "$STATE_FILE" ] || [ "$REBASE_BACKUP" = true ]; then
   TMP_BACKUP_DIR="$(mktemp -d "$HARNESS_DIR/backup.tmp.XXXXXX")"
   ACTIVE_BACKUP_DIR="$TMP_BACKUP_DIR"
   ACTIVE_STATE_FILE="$TMP_BACKUP_DIR/state.env"
@@ -232,9 +287,19 @@ if [ ! -f "$STATE_FILE" ]; then
   backup_path "package.json" "PACKAGE_JSON_EXISTED"
   backup_path "app/core/NavigationService/NavigationService.ts" "NAVIGATION_SERVICE_EXISTED"
   backup_path "app/components/Nav/App/App.tsx" "APP_TSX_EXISTED"
-  rm -rf "$BACKUP_DIR"
+  if [ "$REBASE_BACKUP" = true ] && [ -e "$BACKUP_DIR" ]; then
+    ARCHIVE_DIR="$HARNESS_DIR/backup-stale.$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$(dirname "$ARCHIVE_DIR")"
+    mv "$BACKUP_DIR" "$ARCHIVE_DIR"
+    echo "Archived stale mobile harness backup: $ARCHIVE_DIR" >&2
+  else
+    rm -rf "$BACKUP_DIR"
+  fi
   mkdir -p "$(dirname "$BACKUP_DIR")"
   mv "$TMP_BACKUP_DIR" "$BACKUP_DIR"
+  STATE_FILE="$BACKUP_DIR/state.env"
+  ROLLBACK_BACKUP_DIR="$BACKUP_DIR"
+  ROLLBACK_STATE_FILE="$STATE_FILE"
 else
   REFRESH_BACKUP_DIR="$(mktemp -d "$HARNESS_DIR/refresh-backup.tmp.XXXXXX")"
   ACTIVE_BACKUP_DIR="$REFRESH_BACKUP_DIR"
@@ -273,10 +338,10 @@ function patchPackageJson() {
     'a:status': 'scripts/perps/agentic/app-state.sh status',
     'a:reload': 'scripts/perps/agentic/reload-metro.sh',
     'a:navigate': 'scripts/perps/agentic/app-navigate.sh',
-    'a:ios': 'scripts/perps/agentic/preflight.sh --platform ios --wallet-setup',
-    'a:android': 'scripts/perps/agentic/preflight.sh --platform android --wallet-setup',
-    'a:setup:ios': 'scripts/perps/agentic/preflight.sh --platform ios --clean --wallet-setup',
-    'a:setup:android': 'scripts/perps/agentic/preflight.sh --platform android --clean --wallet-setup',
+    'a:ios': 'scripts/perps/agentic/preflight.sh --platform ios --mode fast --wallet-setup',
+    'a:android': 'scripts/perps/agentic/preflight.sh --platform android --mode fast --wallet-setup',
+    'a:setup:ios': 'scripts/perps/agentic/preflight.sh --platform ios --mode clean --wallet-setup',
+    'a:setup:android': 'scripts/perps/agentic/preflight.sh --platform android --mode clean --wallet-setup',
   };
   let changed = false;
   for (const [key, value] of Object.entries(desired)) {
@@ -342,31 +407,11 @@ console.log(JSON.stringify({
 }));
 NODE
 
-add_git_exclude() {
-  local entry="$1"
-  local git_dir
-  local exclude_file
-  if ! git_dir="$(git -C "$TARGET" rev-parse --git-dir 2>/dev/null)"; then
-    return 0
-  fi
-  case "$git_dir" in
-    /*) ;;
-    *) git_dir="$TARGET/$git_dir" ;;
-  esac
-  exclude_file="$git_dir/info/exclude"
-  mkdir -p "$(dirname "$exclude_file")"
-  touch "$exclude_file"
-  if ! grep -qxF "$entry" "$exclude_file"; then
-    echo "$entry" >> "$exclude_file"
-    echo "$entry" >> "$BACKUP_DIR/added-git-exclude"
-  fi
-}
-
-add_git_exclude ".agent/recipe-harness/"
-add_git_exclude ".skills-cache/"
-add_git_exclude "temp/agentic/recipe-harness/"
-add_git_exclude "scripts/perps/agentic/"
-add_git_exclude "app/core/AgenticService/"
+add_git_exclude_entry ".agent/recipe-harness/" "$BACKUP_DIR/added-git-exclude"
+add_git_exclude_entry ".skills-cache/" "$BACKUP_DIR/added-git-exclude"
+add_git_exclude_entry "temp/agentic/recipe-harness/" "$BACKUP_DIR/added-git-exclude"
+add_git_exclude_entry "scripts/perps/agentic/" "$BACKUP_DIR/added-git-exclude"
+add_git_exclude_entry "app/core/AgenticService/" "$BACKUP_DIR/added-git-exclude"
 
 write_managed_hashes() {
   local hash_file="$BACKUP_DIR/managed-hashes.tsv"
