@@ -79,7 +79,7 @@ human can compare Claude/Codex/Cursor diffs afterwards. Before product edits:
 3. create or switch to a fresh branch named with the runner/model, skill, ticket
    or task slug, and run id. If the source is a Jira ticket, the branch name
    **must start with the lowercased Jira key followed by a hyphen** on both
-   Mobile and Extension targets so regular MetaMask/Farmslot tooling can
+   Mobile and Extension targets so regular MetaMask tooling can
    associate it, for example
    `tat-3216-adr58-codex-mms-recipe-dev-fresh2`. For non-Jira prompts, use a
    stable sanitized task slug such as `adr58-codex-mms-recipe-dev-demo-fresh1`;
@@ -90,6 +90,21 @@ human can compare Claude/Codex/Cursor diffs afterwards. Before product edits:
 If the branch cannot be made clean, mark the branch gate `BLOCKED` before
 implementation. Do not mix multiple model attempts on the same product branch.
 
+## Setup Doctor Gate
+
+Before implementation planning or harness install, invoke/follow
+`/mms-recipe-doctor` from the target checkout when it is installed:
+
+```bash
+.agents/skills/mms-recipe-doctor/scripts/recipe-doctor --target .
+```
+
+Record the doctor status in `CHECKLIST.md`, including fixture/profile status.
+If it reports missing fixtures only, continue only after recording that wallet
+setup may be slower/manual or after the human chooses to create the fixture. If
+it reports an invalid/malformed fixture, missing required tools, or missing
+harness skills, mark the gate `BLOCKED` and fix setup before product edits.
+
 ## Clean Generated Harness State Protocol
 
 A clean product worktree is not enough. Generated, ignored harness/runtime
@@ -99,27 +114,33 @@ paths for the current target repo unless the caller explicitly asks to preserve
 runtime state for debugging:
 
 ```bash
-rm -rf temp/agentic/recipes .agent/recipe-harness/extension .agent/recipe-harness/mobile
+rm -rf "${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}/extension" "${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}/mobile"
 rm -rf temp/tasks/<this-run>/harness
 ```
 
-Then reinstall the lower-level harness from the currently installed skill. Do
-not use `--force`; deleting known generated outputs first is the idempotent
+Then reinstall the lower-level harness from the currently installed skill. The
+install manifest also records an exact `cleanupCommand` (it honors
+`RECIPE_HARNESS_ROOT`) for the full backup-aware cleanup. Do not pass
+`--force-overlay`; deleting known generated outputs first is the idempotent
 refresh. Do not edit `.agents/skills/...`, `.claude/skills/...`, or harness
 source files during product validation.
 
-For Extension, prefer task-local harness output when writing new recipes so each
-run is isolated from shared `temp/agentic/recipes` state:
+For Extension, keep task-local recipe artifacts isolated from shared installed
+runner recipe state by passing `--out` to `verify`/`live` (install does not take
+`--out`):
 
 ```bash
-.agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension install \
-  --target . \
-  --out temp/tasks/<this-run>/harness/recipes
+# Install normally (writes the harness under the resolved root):
+.agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension install --target .
+# Task-local recipe artifacts: verify/live honor --out
+.agents/skills/mms-recipe-harness/scripts/recipe-harness.sh extension verify --target . --out temp/tasks/<this-run>/harness/recipes
 ```
 
-Use the same task-local `validate-recipe.sh` path for dry-run and live recipe
-runs. If an existing shared harness install must be reused, verify its manifest
-and content hash in `CHECKLIST.md`; do not silently reuse stale ignored files.
+Run and validate recipes through the v1 runner —
+`${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}/extension/runner/bin/metamask-recipe run ...`,
+then `farmslot-recipe validate ...` (see recipe-cook). If an existing shared
+harness install must be reused, verify its manifest and content hash in
+`CHECKLIST.md`; do not silently reuse stale ignored files.
 
 ## First Response to the Human
 
@@ -170,7 +191,7 @@ order and record the result in `CHECKLIST.md`:
    do not probe or fall back to other local runtimes. If it has
    `runtimeStart.approved: true` plus `runtimeStart.command`, pass recovery
    through `/mms-recipe-harness` launch/live/verify and let the harness run that
-   approved command; outside Farmslot, any developer/tool may provide the same
+   approved command; outside managed runtimes, any developer/tool may provide the same
    context or `RECIPE_RUNTIME_START_APPROVED=1` with `RECIPE_RUNTIME_START_CMD`;
 3. installed recipe-harness/delegate summaries or manifests in the current
    checkout that identify an already-owned runtime;
@@ -189,7 +210,7 @@ This high-level skill owns product code, recipes, and evidence. It does **not**
 own the lower-level harness implementation during a product/ticket run. Do not
 edit installed delegate files such as `.agents/skills/mms-recipe-harness`,
 `.claude/skills/mms-recipe-harness`, `.cursor/rules/mms-recipe-harness`,
-`.agent/recipe-harness`, or copied harness adapter scripts while fixing a
+`${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}`, or copied harness adapter scripts while fixing a
 product ticket or validating this high-level workflow.
 
 If the harness fails, inspect only enough logs/summaries to classify the failure
@@ -271,6 +292,7 @@ Use it when the task is broader than a bug fix: new feature work, exploratory im
 
 Load only what applies:
 
+- Setup readiness: `/mms-recipe-doctor`
 - Runtime setup: `/mms-recipe-harness`
 - Recipe authoring: `/mms-recipe-cook`
 - Recipe critique: `/mms-recipe-quality`
@@ -560,9 +582,10 @@ Hard gates:
   applies; miscellaneous screenshots may be supporting evidence only.
 - Visual or mixed ACs require screenshot/video evidence tied to that AC.
 - State-only assertions cannot prove visible copy/color/layout claims.
-- Schema warnings on screenshot nodes are quality failures for visual tasks. Add
-  `note` and `claims` to screenshots, then rerun validation instead of treating
-  warning-only schema output as clean.
+- Schema warnings on screenshot nodes are quality failures for visual tasks. Give
+  the `ui.screenshot` node a `description` of what it must prove and back any
+  "must (not) show" condition with a real assertion (`assert_json`/`assert_output`),
+  then rerun validation instead of treating warning-only schema output as clean.
 - The evidence package must contain `artifact-manifest.json` from the harness or
   an explicit evidence manifest you create that lists `summary.json`,
   `trace.json`, logs, screenshots/videos, quality verdict, and recipe path.
@@ -596,42 +619,41 @@ Hard gates:
 15. Ask whether to clean up runtime resources such as Metro/simulator/webpack/CDP now, or record that they were intentionally left running for review.
 16. Return a PR-ready summary and stop for human validation unless asked to open a PR.
 
-For every visual or mixed acceptance criterion, the recipe must use the shared
-visual assertion protocol before screenshot evidence:
+For every visual or mixed acceptance criterion, the recipe must bring the target
+into the viewport and wait for it to be visible before capturing screenshot
+evidence (scroll into view, then wait — the runner polls until `timeout_ms`):
+
+```json
+[
+  { "action": "ui.scroll", "test_id": "target-test-id", "scroll_into_view": true },
+  { "action": "ui.wait_for", "test_id": "target-test-id", "visible": true, "timeout_ms": 10000 }
+]
+```
+
+Then capture the screenshot and describe what it must prove. Express any
+"must not show" condition as a real state assertion (`assert_json` over a
+`metamask.*` read, or `assert_output`), not a screenshot field:
 
 ```json
 {
-  "action": "wait_for",
-  "test_id": "target-test-id",
-  "visibility": "viewport",
-  "scroll": { "strategy": "into_view", "settle_ms": 300 },
-  "timeout_ms": 10000,
-  "poll_ms": 500
+  "action": "ui.screenshot",
+  "description": "AC1: target component is visible with the expected text",
+  "path": "screenshots/after-ac1-target-visible.png"
 }
 ```
 
-Then the `screenshot` node must declare what the image is supposed to prove:
-
-```json
-{
-  "action": "screenshot",
-  "filename": "after-ac1-target-visible.png",
-  "note": "AC1: target component is visible with the expected text",
-  "claims": {
-    "must_show": [{ "test_id": "target-test-id", "visibility": "viewport" }],
-    "must_not_show": [{ "text_contains": "Fund your wallet" }]
-  }
-}
-```
-
-Do not treat `wait_for` fiber-tree/DOM presence, `eval_sync`, controller state,
-or a passing recipe as proof that a user can see the element. Visual claims need
-viewport visibility plus screenshot claims, followed by human/quality review of
-the PNG/video.
+Do not treat `ui.wait_for` fiber-tree/DOM presence, controller state, or a passing
+recipe as proof that a user can see the element. Visual claims need viewport
+visibility (`ui.scroll` + `ui.wait_for` with `visible`) plus a reviewer-visible
+screenshot, followed by human/quality review of the PNG/video.
 
 The evidence package should include: task URL or prompt, product diff summary, harness verify path, recipe path, exact run command, `summary.json`, `trace.json`, `artifact-manifest.json`, screenshots/video for UI claims, quality critique, and explicit gaps.
 
 If runtime state cannot be created, report the gap. Do not claim success from code inspection alone.
+
+## PR creation (offer)
+
+Once evidence is packaged, ASK the human whether to create a PR + upload evidence. If yes → `/mms-recipe-evidence` "Create PR + upload" (artifacts owner is dynamic via `gh api user`, never hard-coded; consent-gate every outward step: repo create, upload, PR create/edit).
 
 ## Output
 

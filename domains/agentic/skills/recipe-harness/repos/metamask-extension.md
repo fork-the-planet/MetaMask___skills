@@ -31,32 +31,28 @@ domains/agentic/skills/recipe-harness/scripts/recipe-harness.sh extension verify
 
 Use `mme-4` for Extension validation when available.
 
+## Runtime readiness (deterministic)
+
+Slots run `watch=off` (frozen, no watcher). Don't hand-debug — the runner decides.
+Full reference: `<harness>/extension/runner/docs/extension-runtime-commands.md`.
+
+- need? → `runtime-decision … --cdp-port <port> --json`; branch `.decision` (`install`|`build`|`relaunch`|`ready`). Don't re-parse webpack logs.
+- id? → `resolve-extension …` (deterministic from dist `key`; never `serviceWorkers()[0]`).
+- one healthy tab → `ensure-ready … --cdp-port <port>` after launch/reopen.
+
+After editing source: `runtime-decision → build? → refresh-build.sh` (one-shot, no watcher) `→ ensure-ready`. Human hot-reload instead: relaunch `--watch on`.
+
 ## Runtime Dependencies
 
 The copied Extension runner expects the target checkout to provide its normal Node dependency set, including `@playwright/test`, `@metamask/client-mcp-core`, and `ws`. If verify fails with module-resolution errors, run the repo's package install/bootstrap first; do not treat that as product behavior failure.
 
 ## Adapter Behavior
 
-Install copies the current Extension recipe runtime under the ignored `temp/agentic/**` harness path and writes `.agent/recipe-harness/extension/manifest.json`.
+Install copies the current Extension recipe runtime under the ignored `temp/agentic/**` harness path and writes `${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}/extension/manifest.json`.
 
 ## Validation
 
-For live runtime proof, verify that:
-
-- CDP connects to the intended browser;
-- the extension build is manifest-complete across historical commits: use
-  `dist/chrome/manifest.json` as the contract, not hardcoded current-build
-  paths such as `scripts/app-init.js` or `service-worker.js`;
-- the extension service worker or MV2 background scripts declared by the
-  manifest are discoverable;
-- one non-UI sample recipe passes;
-- one UI/browser target-inspect sample passes when feasible;
-- product diffs exclude `temp/agentic/**` and harness files.
-- fixture/profile status is printed before long debugging (`READY`,
-  `MISSING_FIXTURES`, or `STALE_OR_INVALID`).
-- CDP/profile/watch reuse decisions are recorded in the verification summary.
-
-Use command recipes for reducers, selectors, controllers, migrations, build/config checks, and other non-UI claims. Use browser/UI actions only for visible Extension behavior.
+See references/contract.md for the full verification checklist. Extension-specific: use `dist/chrome/manifest.json` as the build contract (not hardcoded filenames like `scripts/app-init.js` or `service-worker.js`) so historical MV2/MV3 commits are handled correctly.
 
 ## Prepare Compatibility Notes
 
@@ -71,7 +67,4 @@ When an orchestrator prepares an Extension checkout before running this harness:
 - Use `adapters/extension/scripts/extension-readiness.js --target <repo>
 --cdp-port <port>` as the source-of-truth readiness probe when wiring
   caller-owned runners.
-- Prefer reusing a compatible harness-owned Chrome/CDP profile and existing
-  watch output. If a prepare command would trigger a full rebuild, say that
-  before starting it and either set a cached/watch-only
-  `RECIPE_HARNESS_EXTENSION_LAUNCH_CMD` or ask the human to approve the rebuild.
+- If a prepare command would trigger a full rebuild, say so before starting and ask the human to approve.

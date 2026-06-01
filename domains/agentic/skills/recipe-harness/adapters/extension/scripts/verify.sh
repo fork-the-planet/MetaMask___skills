@@ -2,54 +2,73 @@
 set -euo pipefail
 
 TARGET="$PWD"
-OUT="temp/agentic/recipes"
 CDP_PORT=""
 ARTIFACTS=""
 STATIC_ONLY=false
+OUT=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
-    --out) OUT="$2"; shift 2 ;;
+    --out) [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 2; }; OUT="$2"; shift 2 ;;
     --cdp-port) CDP_PORT="$2"; shift 2 ;;
     --artifacts-dir) ARTIFACTS="$2"; shift 2 ;;
     --static-only) STATIC_ONLY=true; shift ;;
-    -h|--help) echo "Usage: verify.sh [--target <metamask-extension>] [--out <temp/agentic/recipes>] [--cdp-port <port>] [--static-only]"; exit 0 ;;
+    -h|--help) echo "Usage: verify.sh [--target <metamask-extension>] [--out <recipes-dir>] [--cdp-port <port>] [--static-only]"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# Reject a non-numeric --cdp-port before it is interpolated into shell/HTTP/CDP
+# strings. Empty is allowed (static-only verify needs no port).
+if [ -n "$CDP_PORT" ]; then
+  case "$CDP_PORT" in
+    *[!0-9]*) echo "Invalid --cdp-port (must be numeric): $CDP_PORT" >&2; exit 2 ;;
+  esac
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/path.sh"
 TARGET="$(cd "$TARGET" && pwd)"
-HARNESS_DIR="$TARGET/.agent/recipe-harness/extension"
-if ! OUT_ABS="$(resolve_harness_out "$TARGET" "$OUT")"; then
-  echo "Refusing extension harness verify outside target: $OUT" >&2
-  exit 1
+HARNESS_ROOT="$(harness_root)"
+HARNESS_REL="$HARNESS_ROOT/extension"
+HARNESS_DIR="$(harness_dir "$TARGET" extension)"
+RUNNER_BIN="$HARNESS_DIR/runner/bin/metamask-recipe"
+# --out (optional): a task-local recipes dir. Resolve it safely within the target
+# (resolve_harness_out rejects absolute/.. escapes) and prefer its smoke recipe so
+# `live --out <dir>` does not silently fall back to the installed default.
+SMOKE_RECIPE="$HARNESS_DIR/runner/recipes/smoke.extension.recipe.json"
+if [ -n "$OUT" ]; then
+  # Fail fast on a task-local --out that does not contain the requested recipe.
+  # Silently falling back to the installed default would validate a different
+  # (possibly stale) recipe than the caller explicitly asked for.
+  OUT_ABS="$(resolve_harness_out "$TARGET" "$OUT" 2>/dev/null || true)"
+  if [ -z "$OUT_ABS" ]; then
+    echo "recipe-harness verify: --out '$OUT' did not resolve to a safe path under the target." >&2
+    exit 2
+  fi
+  if [ ! -f "$OUT_ABS/smoke.extension.recipe.json" ]; then
+    echo "recipe-harness verify: --out '$OUT' (resolved: $OUT_ABS) has no smoke.extension.recipe.json. Refusing to fall back to the installed default recipe; place the recipe under --out or omit --out." >&2
+    exit 2
+  fi
+  SMOKE_RECIPE="$OUT_ABS/smoke.extension.recipe.json"
 fi
 ARTIFACTS="${ARTIFACTS:-$HARNESS_DIR/verify/$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$ARTIFACTS/logs"
 EXTENSION_ID_FILE="$TARGET/temp/runtime/extension.id"
-read_runtime_context_field() {
-  local context_path="$1"
-  local field="$2"
-  [ -f "$context_path" ] || return 1
-  node -e '
-const fs = require("node:fs");
-const [path, field] = process.argv.slice(1);
-try {
-  const data = JSON.parse(fs.readFileSync(path, "utf8"));
-  const value = field.split(".").reduce((node, key) => {
-    if (node === undefined || node === null) return undefined;
-    return node[key];
-  }, data);
-  if (value !== undefined && value !== null && value !== "") process.stdout.write(String(value));
-} catch (error) {
-  process.stderr.write(String(error && error.message ? error.message : error) + "\n");
-  process.exitCode = 1;
-}
-' "$context_path" "$field"
-}
+# Shared JSON reader: $SCRIPT_DIR/lib when running from the installed copy,
+# else the skill-tree canonical at scripts/lib.
+# shellcheck disable=SC1091
+for _lib in "$SCRIPT_DIR/lib/json-field.sh" "$SCRIPT_DIR/../../../scripts/lib/json-field.sh"; do
+  [ -f "$_lib" ] && { . "$_lib"; break; }
+done
+unset _lib
+# Fail fast with an actionable message if neither path loaded (e.g. an install that
+# predates the lib co-location), instead of a cryptic later `set -e` abort.
+if ! command -v read_runtime_context_field >/dev/null 2>&1; then
+  echo "recipe-harness verify: json-field helper missing (scripts/lib/json-field.sh). Reinstall: /recipe-harness extension install --target $TARGET" >&2
+  exit 1
+fi
 refresh_extension_id() {
   if [ -f "$EXTENSION_ID_FILE" ]; then
     RECIPE_HARNESS_EXTENSION_ID="$(tr -d '[:space:]' < "$EXTENSION_ID_FILE")"
@@ -61,7 +80,7 @@ refresh_extension_id() {
 CONTEXT_PATH="${RECIPE_RUNTIME_CONTEXT:-$TARGET/temp/runtime/agentic-runtime.json}"
 if [ -f "$CONTEXT_PATH" ]; then
   CONTEXT_EXTENSION_ID="$(read_runtime_context_field "$CONTEXT_PATH" extensionId || true)"
-  if [[ "$CONTEXT_EXTENSION_ID" =~ ^[a-z]{32}$ ]]; then
+  if [[ "$CONTEXT_EXTENSION_ID" =~ ^[a-p]{32}$ ]]; then
     mkdir -p "$(dirname "$EXTENSION_ID_FILE")"
     printf '%s\n' "$CONTEXT_EXTENSION_ID" > "$EXTENSION_ID_FILE"
     RECIPE_HARNESS_EXTENSION_ID="$CONTEXT_EXTENSION_ID"
@@ -106,25 +125,45 @@ const stat = fs.statSync(found);
 const isFile = stat.isFile();
 let sha256 = null;
 let validJson = null;
+let hasWalletPassword = false;
+let mobileAccountShape = false;
+const rel = path.relative(target, found);
+const isWalletFixture = rel === 'temp/runtime/wallet-fixture.json' || rel === '.agent/wallet-fixture.json';
 if (isFile) {
   const bytes = fs.readFileSync(found);
   sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
   if (found.endsWith('.json')) {
-    try { JSON.parse(bytes.toString('utf8')); validJson = true; }
-    catch { validJson = false; }
+    try {
+      const parsed = JSON.parse(bytes.toString('utf8'));
+      validJson = true;
+      const accounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
+      hasWalletPassword = typeof parsed.password === 'string' && parsed.password.length > 0;
+      mobileAccountShape = accounts.some((account) => account?.type === 'mnemonic') &&
+        accounts.filter((account) => account?.type === 'privateKey').length >= 2;
+    } catch {
+      validJson = false;
+    }
   }
 }
-const rel = path.relative(target, found);
+const status = validJson === false
+  ? 'STALE_OR_INVALID'
+  : isWalletFixture && hasWalletPassword
+    ? 'READY'
+    : 'PROFILE_HINTS';
 console.log(JSON.stringify({
-  status: validJson === false ? 'STALE_OR_INVALID' : 'READY',
+  status,
   path: rel,
   type: isFile ? 'file' : 'directory',
   sha256,
   modifiedAt: stat.mtime.toISOString(),
   profileHints,
+  hasWalletPassword,
+  mobileAccountShape,
   message: validJson === false
     ? `Fixture status: STALE_OR_INVALID (${rel}). Fix before relying on a clean sandbox.`
-    : `Fixture status: READY (${rel}).`,
+    : status === 'READY'
+      ? `Fixture status: READY (${rel}).`
+      : `Fixture status: PROFILE_HINTS (${rel}); no Mobile-shaped wallet fixture was found for automatic account parity validation.`,
 }));
 NODE
 }
@@ -154,7 +193,9 @@ function getJson(path) {
 }
 (async () => {
   const pid = run(`lsof -iTCP:${port} -sTCP:LISTEN -t | head -1`);
-  const command = pid ? run(`ps -p ${pid} -o command=`) : '';
+  // Validate pid is numeric before interpolating it into the `ps -p` shell string.
+  const safePid = /^[0-9]+$/.test(pid) ? pid : '';
+  const command = safePid ? run(`ps -p ${safePid} -o command=`) : '';
   const version = await getJson('/json/version');
   const targets = await getJson('/json/list');
   const extensionTargets = Array.isArray(targets)
@@ -184,10 +225,88 @@ check_file() {
   fi
 }
 
-check_file ".agent/recipe-harness/extension/manifest.json"
-check_file "$OUT/validate-recipe.sh"
-check_file "$OUT/validate-recipe.js"
-check_file "$OUT/lib/workflow.js"
+check_file "$HARNESS_REL/manifest.json"
+check_file "$HARNESS_REL/action-manifest.json"
+check_file "$HARNESS_REL/runner/bin/metamask-recipe"
+check_file "$HARNESS_REL/runner/manifests/extension.action-manifest.json"
+
+# dist-freshness + build-health now come from the runner's single source of
+# truth (`runtime-decision`), which subsumes the probes this skill used to
+# hand-roll — so the dist-id/source-dirty + webpack-log logic lives in ONE place
+# (matching farmslot preflight's algorithm) and the three layers cannot disagree.
+# git/fs only (no --cdp-port) so this stays harness-independent. The derived
+# dist-freshness.json / build-health.json keep the same status vocab the case
+# mappings + summary below already consume, so behavior is unchanged.
+"$RUNNER_BIN" runtime-decision --adapter extension --target "$TARGET" --json \
+  > "$ARTIFACTS/logs/runtime-decision.json" 2>/dev/null \
+  || printf '%s' '{}' > "$ARTIFACTS/logs/runtime-decision.json"
+# Surface an empty/{} decision loudly: without it, dist-freshness/build-health
+# silently degrade to WARN and the runtime-proof gate is effectively bypassed.
+if [ ! -s "$ARTIFACTS/logs/runtime-decision.json" ] || [ "$(cat "$ARTIFACTS/logs/runtime-decision.json")" = "{}" ]; then
+  echo "recipe-harness verify: runtime-decision returned empty/{} — dist-freshness and build-health cannot be derived from the runner and will degrade to WARN (runtime-proof gate NOT fully validated). Check the runner/build state." >&2
+fi
+node -e '
+const fs = require("fs");
+const dir = process.argv[1];
+let r = {};
+try { r = JSON.parse(fs.readFileSync(dir + "/runtime-decision.json", "utf8")); } catch {}
+const c = r.checks || {};
+const dist = c.dist || { status: "unknown" };
+const distMsg = dist.status === "fresh" ? "dist id matches HEAD; no uncommitted source."
+  : dist.status === "stale" ? (dist.reason === "uncommitted-source"
+      ? ((dist.modified ? dist.modified.length : "some") + " uncommitted source file(s); rebuild or commit.")
+      : ("dist id " + (dist.distGitId || "?") + " != HEAD " + (dist.head || "?") + "; rebuild."))
+  : dist.status === "no-build" ? "no dist/chrome build."
+  : "no git id in dist or not a git checkout; cannot prove parity.";
+fs.writeFileSync(dir + "/dist-freshness.json", JSON.stringify({ ...dist, message: distMsg }));
+const bl = c.buildLog || { status: "unknown" };
+const blMsg = bl.status === "ok" ? "webpack compiled."
+  : bl.status === "no-watch" ? "no webpack watch log; build-health n/a (e.g. one-shot build)."
+  : bl.status === "building" ? "webpack has not reported a successful compile yet."
+  : bl.status === "errors" ? (bl.reason === "stale-cache"
+      ? "webpack build failing on a stale cache (ENOENT on a deduped module). Run `recipe-harness extension live --cdp-port <port> --start-watch` to auto-clear the cache and rebuild."
+      : "webpack build has errors; fix the source/build before validating.")
+  : "build-health unknown.";
+fs.writeFileSync(dir + "/build-health.json", JSON.stringify({ status: bl.status, reason: bl.reason, excerpt: bl.excerpt, message: blMsg }));
+' "$ARTIFACTS/logs" 2>/dev/null \
+  || { printf '%s' '{"status":"unknown","message":"dist-freshness probe error"}' > "$ARTIFACTS/logs/dist-freshness.json"; printf '%s' '{"status":"unknown","message":"build-health probe error"}' > "$ARTIFACTS/logs/build-health.json"; }
+df_read() { node -e 'const fs=require("fs");try{const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(v[process.argv[2]]??""))}catch{process.stdout.write("")}' "$ARTIFACTS/logs/dist-freshness.json" "$1"; }
+df_status="$(df_read status)"
+echo "dist-freshness: ${df_status:-unknown} — $(df_read message)" >&2
+case "$df_status" in
+  fresh) checks+=("{\"name\":\"dist-freshness\",\"status\":\"pass\"}") ;;
+  stale)
+    # A stale dist only fails a LIVE verify (runtime proof would use the wrong
+    # build). --static-only checks install/idempotency shape, not runtime, so
+    # there it is a warning — don't regress install-only verification.
+    if [ "$STATIC_ONLY" = false ]; then
+      checks+=("{\"name\":\"dist-freshness\",\"status\":\"fail\",\"detail\":\"see logs/dist-freshness.json\"}"); status="fail"
+    else
+      checks+=("{\"name\":\"dist-freshness\",\"status\":\"warn\",\"detail\":\"stale (static-only); see logs/dist-freshness.json\"}")
+    fi
+    ;;
+  *)     checks+=("{\"name\":\"dist-freshness\",\"status\":\"warn\",\"detail\":\"${df_status:-unknown}; see logs/dist-freshness.json\"}") ;;
+esac
+
+# build-health.json was produced by the runtime-decision derivation above (the
+# runner reads the webpack watch log; same status vocab as before).
+bh_read() { node -e 'const fs=require("fs");try{process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1],"utf8"))[process.argv[2]]??""))}catch{process.stdout.write("")}' "$ARTIFACTS/logs/build-health.json" "$1"; }
+bh_status="$(bh_read status)"
+echo "build-health: ${bh_status:-unknown} — $(bh_read message)" >&2
+case "$bh_status" in
+  ok|no-watch) checks+=("{\"name\":\"build-health\",\"status\":\"pass\"}") ;;
+  errors)
+    # A broken build only fails a LIVE verify; in --static-only (install-shape only)
+    # it is a loud warning so install/idempotency checks aren't regressed.
+    if [ "$STATIC_ONLY" = false ]; then
+      checks+=("{\"name\":\"build-health\",\"status\":\"fail\",\"detail\":\"see logs/build-health.json\"}"); status="fail"
+    else
+      checks+=("{\"name\":\"build-health\",\"status\":\"warn\",\"detail\":\"build errors (static-only); see logs/build-health.json\"}")
+    fi
+    ;;
+  building) checks+=("{\"name\":\"build-health\",\"status\":\"warn\",\"detail\":\"still compiling; see logs/build-health.json\"}") ;;
+  *)        checks+=("{\"name\":\"build-health\",\"status\":\"warn\",\"detail\":\"${bh_status:-unknown}; see logs/build-health.json\"}") ;;
+esac
 
 live_mode="static-only"
 if [ "$STATIC_ONLY" = false ]; then
@@ -217,31 +336,31 @@ if [ "$STATIC_ONLY" = false ]; then
 
     if (
       cd "$TARGET"
-      bash "$OUT/validate-recipe.sh" "$OUT/domains/browser-features/recipes/service-worker-smoke.json" --cdp-port "$CDP_PORT" --artifacts-dir "$ARTIFACTS/non-ui"
-    ) > "$ARTIFACTS/logs/non-ui-sample.log" 2>&1; then
-      checks+=("{\"name\":\"live non-ui service-worker sample\",\"status\":\"pass\"}")
+      "$RUNNER_BIN" manifest --adapter extension --json
+    ) > "$ARTIFACTS/logs/runner-manifest.json" 2> "$ARTIFACTS/logs/runner-manifest.err"; then
+      checks+=("{\"name\":\"runner manifest\",\"status\":\"pass\"}")
     else
-      checks+=("{\"name\":\"live non-ui service-worker sample\",\"status\":\"fail\"}")
+      checks+=("{\"name\":\"runner manifest\",\"status\":\"fail\",\"detail\":\"see logs/runner-manifest.err\"}")
       status="fail"
     fi
 
     if (
       cd "$TARGET"
-      bash "$OUT/validate-recipe.sh" "$OUT/domains/browser-features/recipes/target-inspect-smoke.json" --cdp-port "$CDP_PORT" --artifacts-dir "$ARTIFACTS/ui"
-    ) > "$ARTIFACTS/logs/ui-browser-sample.log" 2>&1; then
-      checks+=("{\"name\":\"live UI/browser target-inspect sample\",\"status\":\"pass\"}")
+      "$RUNNER_BIN" run "$SMOKE_RECIPE" --adapter extension --project-root "$TARGET" --cdp-port "$CDP_PORT" --artifacts-dir "$ARTIFACTS/runner-smoke" --json
+    ) > "$ARTIFACTS/logs/runner-smoke.log" 2>&1; then
+      checks+=("{\"name\":\"runner v1 smoke\",\"status\":\"pass\"}")
     else
-      checks+=("{\"name\":\"live UI/browser target-inspect sample\",\"status\":\"fail\"}")
+      checks+=("{\"name\":\"runner v1 smoke\",\"status\":\"fail\",\"detail\":\"see logs/runner-smoke.log\"}")
       status="fail"
     fi
   fi
 fi
 
 if git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
-  git -C "$TARGET" status --short -- . ":(exclude).agent/recipe-harness" ":(exclude).skills-cache" ":(exclude)$OUT" > "$ARTIFACTS/logs/product-diff-excluding-harness.log" 2>&1 || true
+  git -C "$TARGET" status --short -- . ":(exclude)$HARNESS_ROOT" ":(exclude).skills-cache" > "$ARTIFACTS/logs/product-diff-excluding-harness.log" 2>&1 || true
 fi
 
-RECIPE_HARNESS_LIVE_MODE="$live_mode" node - "$ARTIFACTS" "$TARGET" "$status" "${checks[@]}" <<'NODE'
+RECIPE_HARNESS_LIVE_MODE="$live_mode" RECIPE_HARNESS_ROOT_EXCLUDE="$HARNESS_ROOT" node - "$ARTIFACTS" "$TARGET" "$status" "${checks[@]}" <<'NODE'
 const fs = require('fs');
 const path = require('path');
 const cp = require('child_process');
@@ -251,6 +370,8 @@ const liveMode = process.env.RECIPE_HARNESS_LIVE_MODE || 'unknown';
 let fixtureStatus = null;
 let cdpHolder = null;
 let readinessReport = null;
+let distFreshness = null;
+try { distFreshness = JSON.parse(fs.readFileSync(path.join(artifacts, 'logs/dist-freshness.json'), 'utf8')); } catch {}
 try { fixtureStatus = JSON.parse(fs.readFileSync(path.join(artifacts, 'logs/fixture-status.json'), 'utf8')); } catch {}
 try { cdpHolder = JSON.parse(fs.readFileSync(path.join(artifacts, 'logs/cdp-holder.json'), 'utf8')); } catch {}
 try { readinessReport = JSON.parse(fs.readFileSync(path.join(artifacts, 'logs/extension-readiness.json'), 'utf8')); } catch {}
@@ -262,7 +383,8 @@ function runGit(args) {
     return null;
   }
 }
-const statusShort = runGit(['status', '--short', '--', '.', ':(exclude).agent/recipe-harness', ':(exclude).skills-cache']);
+const harnessRootExclude = process.env.RECIPE_HARNESS_ROOT_EXCLUDE || 'temp/agentic/recipe-harness';
+const statusShort = runGit(['status', '--short', '--', '.', `:(exclude)${harnessRootExclude}`, ':(exclude).skills-cache']);
 const gitStatus = {
   branch: runGit(['branch', '--show-current']),
   head: runGit(['rev-parse', '--short', 'HEAD']),
@@ -274,7 +396,7 @@ const extensionIdPath = path.join(target, 'temp/runtime/extension.id');
 let markerExtensionId = null;
 try {
   const value = fs.readFileSync(extensionIdPath, 'utf8').trim();
-  if (/^[a-z]{32}$/.test(value)) markerExtensionId = value;
+  if (/^[a-p]{32}$/.test(value)) markerExtensionId = value;
 } catch {}
 const cdpTarget = readinessReport?.cdp ? {
   selectedExtensionId: readinessReport.cdp.selectedExtensionId || null,
@@ -306,6 +428,7 @@ fs.writeFileSync(path.join(artifacts, 'summary.json'), `${JSON.stringify({
     reason: 'extension verify inspects the supplied CDP runtime; wrapper/preflight ownership must be recorded by the caller before stopping processes',
   },
   gitStatus,
+  distFreshness,
   runtimePolicy: {
     runtimeReusePolicy: 'reuse a running harness-compatible CDP target when possible; wrapper auto-start must use a cached/watch-only prepare path unless the human explicitly permits a rebuild',
   },

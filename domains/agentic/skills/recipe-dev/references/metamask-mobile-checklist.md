@@ -31,7 +31,7 @@ Mobile-specific gates:
 - Runner command form: Claude/Cursor use `/mms-recipe-*`; Codex/OpenAI agents use `$mms-recipe-*`. When this checklist names `/mms-recipe-harness`, `/mms-recipe-cook`, `/mms-recipe-quality`, `/mms-recipe-evidence`, or `/mms-recipe-wallet-control`, use the runner-appropriate command form or the installed delegate file path for the current runner.
 
 - Runtime discovery is portable: prefer `RECIPE_RUNTIME_CONTEXT`, `RECIPE_SLOT_ID`, `RECIPE_CDP_PORT`/`CDP_PORT`, `RECIPE_METRO_PORT`/`METRO_PORT`, `RECIPE_WATCHER_PORT`/`WATCHER_PORT`, simulator/device env, and installed harness summaries before probing fallback ports. Do not assume `9222` or start raw product builds when no context is present; record missing runtime context instead.
-- Harness boundary: do not edit installed `mms-recipe-harness`/wallet-control/cook/quality/evidence delegate files, `.agent/recipe-harness` overlays, or copied adapter scripts during a product/ticket run. Inspect summaries/logs only enough to classify failures. If a harness code change is required, stop the runtime lane as `BLOCKED: harness defect` with artifact paths.
+- Harness boundary: do not edit installed `mms-recipe-harness`/wallet-control/cook/quality/evidence delegate files, `${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}` overlays, or copied adapter scripts during a product/ticket run. Inspect summaries/logs only enough to classify failures. If a harness code change is required, stop the runtime lane as `BLOCKED: harness defect` with artifact paths.
 
 - Prefer after evidence for new/additive UI; use before/after when there is a meaningful previous state.
 - Do not ask whether to proceed with harness/recipe validation after implementation checks. Proceed automatically.
@@ -40,11 +40,12 @@ Mobile-specific gates:
 - Direct `scripts/perps/agentic/*` screenshots or evals are supporting evidence only. They do not satisfy recipe gates unless `/mms-recipe-harness`, `/mms-recipe-cook`, `/mms-recipe-quality`, and `/mms-recipe-evidence` were explicitly invoked/followed and produced the recipe package artifacts.
 - Do not claim recipe infrastructure is absent just because a repo-root `validate-recipe.js` is missing. Check installed skill delegate paths first (`.claude/skills/mms-recipe-harness`, `.agents/skills/mms-recipe-harness`, `.cursor/rules/mms-recipe-harness`) and follow their scripts/adapters. If no executable `recipe.json` plus harness-produced `summary.json` and `trace.json` exists, classify runtime/visual proof as `FAIL`/`BLOCKED: no recipe protocol`; ad-hoc CDP probes, manual evidence markdown, black screenshots, or human-to-confirm notes do not satisfy the recipe gates.
 - Do not manufacture proof by mutating app state: no `window.stateHooks`, `stateHooks.submitRequestToBackground`, Redux/store writes, React/fiber mutation, DOM/native-tree injection, controller/provider mutation, or helper that directly creates, closes, clears, seeds, or inserts the target position/value/banner. Use a real user flow or harness-owned pre-start fixture; otherwise mark the affected AC as a fixture/runtime gap.
-- Use viewport visibility + screenshot `claims` for visible UI/copy/layout claims.
+- Use viewport visibility (`ui.scroll` `scroll_into_view` + `ui.wait_for` `visible`) plus a screenshot for visible UI/copy/layout claims.
 - Do not claim success from controller state alone when ACs describe user-visible behavior.
 - For visual/mixed ACs, never mark an AC `code-proven`. If no runtime PNG/video exists because Metro/CDP/device is unavailable, the visual AC is `BLOCKED: no runtime visual evidence`.
-- Fix schema warnings before packaging visual proof. Screenshot nodes need
-  `note` and `claims`; warning-only schema output is not a clean final state.
+- Fix schema warnings before packaging visual proof. Give `ui.screenshot` nodes a
+  `description` and assert "must (not) show" with `assert_json`/`assert_output`;
+  warning-only schema output is not a clean final state.
 - If the runner/harness does not emit `artifact-manifest.json`, create an
   explicit evidence manifest that lists recipe path, exact command,
   `summary.json`, `trace.json`, logs, screenshots/videos, quality verdict, and
@@ -72,7 +73,7 @@ Mobile-specific gates:
   Either add a better measurable target/scroll/navigation and rerun, or keep the
   verdict `PASS-WITH-GAPS` and rely on visually-read screenshots as weaker proof.
 - If preflight/verify succeeds but a later recipe loses Metro/CDP, try running
-  preflight and `validate-recipe.sh` in one shell so Metro remains alive, then
+  preflight and the v1 runner (`${RECIPE_HARNESS_ROOT:-temp/agentic/recipe-harness}/mobile/runner/bin/metamask-recipe run ...`) in one shell so Metro remains alive, then
   record that command in the evidence package.
 - If the artifact manifest lists logical screenshot names but the runner writes
   timestamped PNGs, create/update an evidence manifest with the actual PNG paths

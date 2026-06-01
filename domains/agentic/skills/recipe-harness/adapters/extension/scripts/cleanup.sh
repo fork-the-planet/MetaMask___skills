@@ -2,91 +2,22 @@
 set -euo pipefail
 
 TARGET="$PWD"
-OUT=""
-FORCE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
-    --out) OUT="$2"; shift 2 ;;
-    --force) FORCE=true; shift ;;
-    -h|--help) echo "Usage: cleanup.sh [--target <metamask-extension>] [--out <temp/agentic/recipes>] [--force]"; exit 0 ;;
+    --out) [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 2; }; shift 2 ;;
+    -h|--help) echo "Usage: cleanup.sh [--target <metamask-extension>]"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
-
-dir_content_hash() {
-  find "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | awk '{print $1}'
-}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/path.sh"
 TARGET="$(cd "$TARGET" && pwd)"
-HARNESS_DIR="$TARGET/.agent/recipe-harness/extension"
-BACKUP_DIR="$HARNESS_DIR/backup"
-STATE_FILE="$BACKUP_DIR/state.env"
+HARNESS_DIR="$(harness_dir "$TARGET" extension)"
 
-if [ -z "$OUT" ]; then
-  MANIFEST="$HARNESS_DIR/manifest.json"
-  if [ ! -f "$MANIFEST" ]; then
-    echo "Missing extension harness manifest; pass --out explicitly for cleanup." >&2
-    exit 1
-  fi
-  OUT="$(node - "$MANIFEST" <<'NODE'
-const fs = require('fs');
-const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-const installedPath = manifest.installedPaths && manifest.installedPaths[0];
-if (!installedPath) process.exit(1);
-process.stdout.write(installedPath);
-NODE
-)"
-fi
-
-if ! OUT_ABS="$(resolve_harness_out "$TARGET" "$OUT")"; then
-  echo "Refusing extension harness cleanup outside target: $OUT" >&2
-  exit 1
-fi
-
-if [ ! -f "$STATE_FILE" ]; then
-  echo "No extension harness backup found at $STATE_FILE" >&2
-  exit 1
-fi
-
-while IFS= read -r _line || [ -n "$_line" ]; do
-  [[ "$_line" =~ ^[[:space:]]*(#|$) ]] && continue
-  _key="${_line%%=*}"
-  _val="${_line#*=}"
-  case "$_key" in
-    OUT_EXISTED) ;;
-    *) continue ;;
-  esac
-  export "$_key=$_val"
-done < "$STATE_FILE"
-unset _line _key _val
-
-INSTALLED_HASH_FILE="$HARNESS_DIR/installed-content.sha256"
-if [ -e "$OUT_ABS" ] && [ -f "$INSTALLED_HASH_FILE" ] && ! $FORCE; then
-  prev_hash="$(cat "$INSTALLED_HASH_FILE")"
-  curr_hash="$(dir_content_hash "$OUT_ABS")"
-  if [ "$prev_hash" != "$curr_hash" ]; then
-    echo "Extension harness output has local modifications." >&2
-    echo "Cleanup would discard user edits in: $OUT" >&2
-    echo "Use --force to proceed anyway." >&2
-    exit 1
-  fi
-fi
-
-if [ -L "$OUT_ABS" ]; then
-  echo "Refusing extension harness cleanup: output path is a symlink." >&2
-  exit 1
-fi
-rm -rf "$OUT_ABS"
-if [ "${OUT_EXISTED:-0}" = "1" ]; then
-  mkdir -p "$(dirname "$OUT_ABS")"
-  cp -a "$BACKUP_DIR/original" "$OUT_ABS"
-fi
-
-if [ -f "$BACKUP_DIR/added-git-exclude" ]; then
+if [ -s "$HARNESS_DIR/added-git-exclude" ]; then
   git_dir="$(git -C "$TARGET" rev-parse --git-dir 2>/dev/null || true)"
   if [ -n "$git_dir" ]; then
     case "$git_dir" in
@@ -95,18 +26,22 @@ if [ -f "$BACKUP_DIR/added-git-exclude" ]; then
     esac
     exclude_file="$git_dir/info/exclude"
     if [ -f "$exclude_file" ]; then
+      # Remove only the lines THIS install recorded, one occurrence per distinct
+      # ledger entry (the appended copy is the last match). A pre-existing
+      # duplicate copy, or a stale/duplicate ledger entry, must never drop a line
+      # we did not add this run.
       tmp_file="$(mktemp)"
-      cp "$exclude_file" "$tmp_file"
-      while IFS= read -r entry; do
-        [ -n "$entry" ] || continue
-        grep -vxF "$entry" "$tmp_file" > "$tmp_file.next" || true
-        mv "$tmp_file.next" "$tmp_file"
-      done < "$BACKUP_DIR/added-git-exclude"
+      awk '
+        NR==FNR { if (length($0)) want[$0]=1; next }
+        { lines[++n]=$0; if ($0 in want) last[$0]=n }
+        END { for (k in last) drop[last[k]]=1; for (i=1;i<=n;i++) if (!(i in drop)) print lines[i] }
+      ' "$HARNESS_DIR/added-git-exclude" "$exclude_file" > "$tmp_file"
       mv "$tmp_file" "$exclude_file"
     fi
   fi
 fi
 
+# Leave the consumer's .skills-cache/ alone: it is gitignored and owned by the
+# product checkout, not the harness.
 rm -rf "$HARNESS_DIR"
-rm -rf "$TARGET/.skills-cache"
 echo "Cleaned extension recipe harness from $TARGET"

@@ -5,7 +5,7 @@ parent: recipe-wallet-control
 
 # Recipe Wallet Control - MetaMask Extension
 
-Use the Extension recipe runtime injected by `/recipe-harness` to drive wallet-semantic flows through browser/CDP contexts. Keep injection, browser launch, and runner installation in `/recipe-harness`; this overlay names the wallet primitives an agent may compose in `/recipe-cook`.
+Use the Extension recipe runtime injected by `/recipe-harness` to drive wallet-semantic flows through browser/CDP contexts. Install/launch via /recipe-harness; this overlay names the wallet primitives.
 
 ## Prerequisites
 
@@ -19,59 +19,68 @@ Before any primitive:
 
 If harness verify fails, report wallet-control proof as blocked by runtime readiness, not as product failure.
 
+**Dist-freshness gate.** Verify's `dist-freshness` check compares the git id in `dist/chrome/manifest.json` to HEAD:
+
+- `stale` (verify fails) — dist built from another commit, or source edited since build. Stop; ask: reuse / `yarn start` (watch) / rebuild. (`build:test` = e2e baseline only.)
+- `no-build` / `unknown` — can't prove parity; confirm before relying on it.
+- `fresh` — proceed.
+
 ## Core Wallet Primitives
 
-These primitives are backed by `temp/agentic/recipes/domains/extension-core/**` after harness install.
+### `metamask.wallet.ensure_unlocked`
 
-### `unlock`
-
-Use the named flow when a vault already exists:
-
-```bash
-bash temp/agentic/recipes/validate-recipe.sh \
-  temp/agentic/recipes/domains/extension-core/flows/unlock-wallet.json \
-  --cdp-port <port> \
-  --artifacts-dir <artifacts-dir>
-```
-
-Expected proof: unlock form is absent or password entry succeeds, then `account-menu-icon` is visible.
-
-### `select-account`
-
-Use the named flow with a target address:
-
-```bash
-bash temp/agentic/recipes/validate-recipe.sh \
-  temp/agentic/recipes/domains/extension-core/flows/select-account.json \
-  --cdp-port <port> \
-  --param address=0x... \
-  --artifacts-dir <artifacts-dir>
-```
-
-Expected proof: `extension-core/accounts` reports `selectedAddress` equal to the requested address.
-
-### `navigate`
-
-Use `navigate` nodes or existing flows such as `navigate-settings.json` for Extension routes.
-
-### `screenshot`
-
-Use recipe `screenshot` nodes after a route, selector, or state settle condition. Do not screenshot a loading or transitional page as proof.
-
-### `eval-state`
-
-Use named eval refs before raw service-worker/page eval:
+Use when a vault/profile already exists and may be locked:
 
 ```json
-{ "action": "eval_ref", "ref": "extension-core/accounts" }
-{ "action": "eval_ref", "ref": "extension-core/network" }
-{ "action": "eval_ref", "ref": "extension-core/wallet-state" }
+{ "action": "metamask.wallet.ensure_unlocked" }
 ```
+
+Expected proof: the unlock form is absent after the action and wallet state can be read.
+
+### `metamask.wallet.select_account`
+
+Use with a deterministic fixture address:
+
+```json
+{ "action": "metamask.wallet.select_account", "address": "0x..." }
+```
+
+Expected proof: `metamask.wallet.read_state` reports the selected account/address expected by the recipe.
+
+### `ui.navigate`
+
+```json
+{ "action": "ui.navigate", "hash": "#/?tab=perps" }
+```
+
+### `metamask.wallet.read_state`
+
+Read wallet state without mutating UI:
+
+```json
+{ "action": "metamask.wallet.read_state" }
+```
+
+Use this as internal-state proof alongside visible UI proof. Do not use raw page/service-worker evaluation to fabricate a visible result.
+
+### `ui.screenshot`
+
+Capture visual proof after a route, selector, or state settle condition:
+
+```json
+{ "action": "ui.screenshot", "path": "screenshots/wallet-state.png" }
+```
+
+Do not screenshot a loading or transitional page as proof.
 
 ## Interaction Helpers
 
-Use `press`, `set_input`, `wait_for`, and `screenshot` for real UI paths. Use service-worker or page eval only for inspection, setup, or internal-state proof; never use it to fabricate a visible UI result.
+Use namespaced Recipe v1 UI actions for real UI paths: `ui.press`, `ui.wait_for`, `ui.scroll`, and `ui.screenshot`. No text-entry ui.* yet; use a manifest domain action.
 
 ## Current Boundary
 
-`setup-wallet` for a brand-new Extension profile is not a stable wallet-control primitive yet. Prefer a prepared debug profile or an existing harness fixture flow; if neither exists, record the missing fixture/profile setup as a proof gap.
+```bash
+/mms-recipe-harness live --cdp-port <port> --launch-existing-dist  # fixture at temp/runtime/wallet-fixture.json or .agent/wallet-fixture.json
+```
+
+Harness injects fixture state and unlocks before proof.

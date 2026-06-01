@@ -62,11 +62,11 @@ function readExpectedExtensionId(target) {
   const idPath = path.join(target, 'temp/runtime/extension.id');
   if (!fs.existsSync(idPath)) return '';
   const id = fs.readFileSync(idPath, 'utf8').trim();
-  return /^[a-z]{32}$/.test(id) ? id : '';
+  return /^[a-p]{32}$/.test(id) ? id : '';
 }
 
 function writeExtensionId(target, extensionId) {
-  if (!/^[a-z]{32}$/.test(extensionId)) return false;
+  if (!/^[a-p]{32}$/.test(extensionId)) return false;
   const idPath = extensionIdPath(target);
   fs.mkdirSync(path.dirname(idPath), { recursive: true });
   const existing = fs.existsSync(idPath) ? fs.readFileSync(idPath, 'utf8').trim() : '';
@@ -180,7 +180,7 @@ async function cdpEvaluate(target, webSocketDebuggerUrl, expression, timeoutMs =
 
 function extensionIdFromTarget(target) {
   const url = String(target.url || '');
-  const match = url.match(/^chrome-extension:\/\/([a-z]{32})\//u);
+  const match = url.match(/^chrome-extension:\/\/([a-p]{32})\//u);
   return match ? match[1] : '';
 }
 
@@ -267,16 +267,32 @@ async function inspectCdp(target, cdpPort, expectedExtensionId, expectedServiceW
       pageTarget.webSocketDebuggerUrl,
       `(() => {
         const text = document.body?.innerText || '';
+        const cell = (sel) => document.querySelector(sel)?.innerText?.trim() || '';
+        // React error-boundary screen (ui/pages/error-page); deterministic testids.
+        const errorBoundaryMessage = cell('[data-testid="error-page-error-message"]');
+        const errorBoundaryName = cell('[data-testid="error-page-error-name"]');
+        // Testid-only trigger: ui/pages/error-page reliably renders these testids.
+        // Avoid matching the visible phrase in body text (false positives).
+        const hasErrorBoundary = Boolean(errorBoundaryMessage) || Boolean(errorBoundaryName);
         return {
           title: document.title,
           url: location.href,
           textSample: text.slice(0, 500),
           hasStartupError: /MetaMask had trouble starting|Background connection unresponsive|Unknown Infura network/i.test(text),
+          hasErrorBoundary,
+          errorBoundaryName,
+          errorBoundaryMessage: errorBoundaryMessage || (hasErrorBoundary ? text.slice(0, 300) : ''),
         };
       })()`,
     );
     if (ui && !ui.skipped && ui.hasStartupError) {
       throw Object.assign(new Error('MetaMask extension page loaded startup error UI'), {
+        report: { cdp: { browser: version.Browser || 'unknown', selectedExtensionId, ui } },
+      });
+    }
+    if (ui && !ui.skipped && ui.hasErrorBoundary) {
+      const detail = [ui.errorBoundaryName, ui.errorBoundaryMessage].filter(Boolean).join(': ');
+      throw Object.assign(new Error(`MetaMask UI crashed (React error boundary)${detail ? `: ${detail}` : ''}`), {
         report: { cdp: { browser: version.Browser || 'unknown', selectedExtensionId, ui } },
       });
     }
