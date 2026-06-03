@@ -42,6 +42,9 @@ As a smart account:
 
 ```typescript
 import { toMetaMaskSmartAccount, Implementation } from '@metamask/smart-accounts-kit'
+import { privateKeyToAccount } from 'viem/accounts'
+
+const account = privateKeyToAccount(privateKey)
 
 const sessionAccount = await toMetaMaskSmartAccount({
   client: publicClient,

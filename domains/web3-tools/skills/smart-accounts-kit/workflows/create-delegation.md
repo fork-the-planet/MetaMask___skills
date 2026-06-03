@@ -90,8 +90,9 @@ You can also sign standalone (without a smart account instance):
 
 ```typescript
 import { signDelegation } from '@metamask/smart-accounts-kit'
+import { sepolia } from 'viem/chains'
 
-const signature = signDelegation({
+const signature = await signDelegation({
   privateKey,
   delegation,
   chainId: sepolia.id,

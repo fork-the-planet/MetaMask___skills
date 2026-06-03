@@ -83,12 +83,12 @@ const redeemCalldata = DelegationManager.encode.redeemDelegations({
 
 ## Send the user operation
 
-Submit the user operation to the bundler. The delegate smart account calls itself with the redeem calldata:
+Submit the user operation to the bundler. The delegate smart account calls the DelegationManager with the redeem calldata:
 
 ```typescript
 const userOpHash = await bundlerClient.sendUserOperation({
   account: delegateSmartAccount,
-  calls: [{ to: delegateSmartAccount.address, data: redeemCalldata }],
+  calls: [{ to: delegateSmartAccount.environment.DelegationManager, data: redeemCalldata }],
   maxFeePerGas,
   maxPriorityFeePerGas,
 })

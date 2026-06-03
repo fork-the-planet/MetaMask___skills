@@ -20,7 +20,7 @@ description: Build dApps with MetaMask Smart Accounts Kit — ERC-4337 smart acc
 ## Installation
 
 ```bash
-npm install @metamask/smart-accounts-kit
+npm install @metamask/smart-accounts-kit permissionless
 ```
 
 ## Which smart account type to use

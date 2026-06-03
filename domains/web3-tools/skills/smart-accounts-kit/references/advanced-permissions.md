@@ -37,7 +37,7 @@ For more details, see the [requestExecutionPermissions reference](https://docs.m
 | `native-token-stream` | You want a linear streaming native token limit that accrues over time |
 | `token-approval-revocation` | You want to revoke existing token approvals (ERC-20, ERC-721, Permit2) on behalf of the user |
 
-All permission types accept optional `startTime`, `justification`, and `isAdjustmentAllowed` parameters. For full parameter details, see the [permissions reference](https://docs.metamask.io/smart-accounts-kit/reference/advanced-permissions/permissions.md).
+The token allowance, native token allowance, periodic, and stream permission types accept optional `startTime`, `justification`, and `isAdjustmentAllowed` parameters. The `token-approval-revocation` type only accepts `justification` and `isAdjustmentAllowed`. For full parameter details, see the [permissions reference](https://docs.metamask.io/smart-accounts-kit/reference/advanced-permissions/permissions.md).
 
 ### Response structure
 
