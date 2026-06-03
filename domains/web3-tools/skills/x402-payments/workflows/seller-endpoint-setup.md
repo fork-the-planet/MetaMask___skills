@@ -47,8 +47,8 @@ const resourceServer = new x402ResourceServer(facilitatorClient).register(
 
 MetaMask facilitator URLs by network:
 - Base Sepolia: `https://tx-sentinel-base-sepolia.dev-api.cx.metamask.io/platform/v2/x402`
-- Base: `https://tx-sentinel-monad-mainnet.dev-api.cx.metamask.io/platform/v2/x402`
-- Monad: `https://tx-sentinel-base-mainnet.dev-api.cx.metamask.io/platform/v2/x402`
+- Base: `https://tx-sentinel-base-mainnet.dev-api.cx.metamask.io/platform/v2/x402`
+- Monad: `https://tx-sentinel-monad-mainnet.dev-api.cx.metamask.io/platform/v2/x402`
 
 ## Add payment middleware to protected routes
 
