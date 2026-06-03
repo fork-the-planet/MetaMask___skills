@@ -14,6 +14,7 @@ metadata:
 - Capture screenshots as evidence
 - Verify onboarding, unlock, transaction, swap, or dapp-confirmation flows
 - Debug unexpected UI state in the extension or sidepanel
+- Inject test data into features that read from in-memory streams or data channels (not Redux) when fixtures and WebSocket mocks can't reach the data source
 
 For architecture details, see `test/e2e/playwright/llm-workflow/README.md`.
 
@@ -137,6 +138,16 @@ After any interaction sequence:
 1. `mm describe-screen` to verify expected state
 2. If wrong: `mm screenshot --name "debug-<action>"`, check `mm knowledge-search "<flow>"`, retry
 3. Continue only when expected state is confirmed
+
+### 5b. Edge Case: Component Not Responding to State Changes
+
+If you change Redux state via CDP but the target component doesn't update:
+
+1. **The component reads from a different data source** — an in-memory stream, data channel, or React context that is NOT backed by Redux.
+2. Read the component's source to identify the hook it uses (`useSelector` = Redux; anything else = likely in-memory).
+3. Use the [React Fiber Data Injection](references/state-manipulation.md#5-inject-into-in-memory-data-sources-react-fiber-walk) pattern from the State Manipulation reference.
+4. Disconnect the live data feed first (prevents overwrite), then push your test data.
+5. Re-verify with `mm describe-screen`.
 
 ### 6. Confirmations (Dapp Flows)
 
